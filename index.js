@@ -1,6 +1,7 @@
 const lgtv2 = require('lgtv2');
 const wol = require('wake_on_lan');
 const tcpp = require('tcp-ping');
+const cec = require('cec-promise');
 
 let Service, Characteristic;
 
@@ -41,6 +42,9 @@ function webos3Accessory(log, config, api) {
     this.connected = false;
     this.checkCount = 0;
     this.checkAliveInterval = null;
+
+    this.cecControlNibble = config['cecAddress'];
+    this.cecAddressByte = ((14 % 16) << 4) | (this.cecControlNibble % 16);
 
     lgtv = new lgtv2({
         url: this.url,
@@ -116,6 +120,22 @@ function webos3Accessory(log, config, api) {
         this.log.debug('webOS - connecting to TV');
         this.connected = false;
     });
+
+    cec.on('REPORT_POWER_STATUS', status => {
+        this.log(`${this.name} reportStatus: ${status}`);
+        if (Number(status.source) === this.cecControlNibble) {
+          const powerStatus = (() => {
+            switch (status.args[0]) {
+              case cec.code.PowerStatus.ON: return 'on';
+              case cec.code.PowerStatus.STANDBY: return 'standby';
+              default: return 'unknown';
+            }
+          })();
+          this.log(`${this.name} reportStatus: ${powerStatus}`);
+          //callback(powerStatus);
+        }
+      });
+
 
     this.powerService = new Service.Switch(this.name + " Power", "powerService");
     this.informationService = new Service.AccessoryInformation();
@@ -354,13 +374,15 @@ webos3Accessory.prototype.powerOnTvWithCallback = function (callback) {
 
 webos3Accessory.prototype.checkTVState = function (callback) {
     tcpp.probe(this.ip, 3000, (err, isAlive) => {
+        this.log.debug('webOS - TV state: %s', isAlive ? "On" : "Off");
+
         if (!isAlive) {
             this.connected = false;
+            callback(null, this.connected);
         } else {
-            this.connected = true;
+            this.checkCount = 0;
+            this.checkWakeOnLan(callback);
         }
-        this.log.debug('webOS - TV state: %s', this.connected ? "On" : "Off");
-        callback(null, this.connected);
     });
 };
 
@@ -443,10 +465,10 @@ webos3Accessory.prototype.checkWakeOnLan = function (callback) {
         this.checkCount = 0;
         callback(null, true);
     } else {
-        if (this.checkCount < 3) {
+        if (this.checkCount < 5) {
             this.checkCount++;
             lgtv.connect(this.url);
-            setTimeout(this.checkWakeOnLan.bind(this, callback), 5000);
+            setTimeout(this.checkWakeOnLan.bind(this, callback), 12000);
         } else {
             this.checkCount = 0;
             callback(new Error('webOS - wake timeout'));
@@ -456,18 +478,43 @@ webos3Accessory.prototype.checkWakeOnLan = function (callback) {
 
 // HOMEBRIDGE STATE SETTERS/GETTERS
 webos3Accessory.prototype.getState = function (callback) {
-    lgtv.connect(this.url);
+    //lgtv.connect(this.url);
     this.checkTVState.call(this, callback);
 };
 
 webos3Accessory.prototype.setState = function (state, callback) {
     if (state) {
         if (!this.connected) {
-            wol.wake(this.mac, (error) => {
-                if (error) return callback(new Error('webOS - wake on lan error'));
-                this.checkCount = 0;
-                setTimeout(this.checkWakeOnLan.bind(this, callback), 5000);
-            })
+            // wol.wake(this.mac, (error) => {
+            //     if (error) return callback(new Error('webOS - wake on lan error'));
+            //     this.checkCount = 0;
+            //     setTimeout(this.checkWakeOnLan.bind(this, callback), 5000);
+            // })
+            cec.request(this.cecAddressByte, 'GIVE_DEVICE_POWER_STATUS', 'REPORT_POWER_STATUS')
+                .then((res) => {
+                    var on = res.status ? 0 : 1;
+                    this.log(`${this.name} getOn: ${on}`);
+                    
+                    if (state == on) {
+                        this.log(`${this.name} setOn: already ${state ? 'on' : 'off'}`);
+                      } else {
+                        let newMode = state ? 'on' : 'standby';
+                        this.log(`${this.name} setOn: ${state}`);
+                        cec.send(`${newMode} ${this.cecControlNibble}`);
+                      }
+                      this.checkCount = 0;
+                      setTimeout(this.checkWakeOnLan.bind(this), 5000);
+                      callback(null, true);
+
+                })
+                .catch((err) => {
+                    this.log(err);
+                    callback(err);
+                });
+
+
+
+
         } else {
             callback(null, true);
         }
@@ -524,7 +571,6 @@ webos3Accessory.prototype.getChannel = function (callback) {
 
 webos3Accessory.prototype.setChannel = function (level, callback) {
     if (this.connected) {
-        this.log.info("channel const" + this.channelConstant)
         const constant = this.channelConstant < 10 ? (this.channelConstant * 100) :
             ((this.channelConstant - this.channelConstant%10) * 10)
         const channelNumber = constant + level
@@ -560,13 +606,13 @@ webos3Accessory.prototype.setAppSwitchState = function (state, callback, appId) 
         callback(null, state);
     } else {
 		
-		if (state) {
-			this.log.info('webOS - Trying to launch %s but TV is off, attempting to power on the TV', appId);
-			this.powerOnTvWithCallback(() => {
-				lgtv.request('ssap://system.launcher/launch', {id: appId});
-				callback(null, true);
-			});
-        }
+		// if (state) {
+		// 	this.log.info('webOS - Trying to launch %s but TV is off, attempting to power on the TV', appId);
+		// 	this.powerOnTvWithCallback(() => {
+		// 		lgtv.request('ssap://system.launcher/launch', {id: appId});
+		// 		callback(null, true);
+		// 	});
+        // }
 		
       //  callback(new Error('webOS - is not connected'))
     }
